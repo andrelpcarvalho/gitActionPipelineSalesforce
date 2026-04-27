@@ -1,0 +1,155 @@
+###############################################################################
+# Rollback PRD
+#
+# Gatilho: Manual (workflow_dispatch)
+# Objetivo: Reverter um PR específico da main, desfazendo o deploy em PRD
+#
+# Pré-requisitos:
+#   - Secret GH_PAT com Personal Access Token que tenha permissão de push
+#     em branches protegidas (necessário para push direto na main)
+#   - Environment PRD configurado com aprovadores
+#   - O PR a ser revertido deve ter sido mergeado na main
+#
+# Comportamento:
+#   1. Recebe o número do PR e o motivo do rollback
+#   2. Localiza o merge commit do PR
+#   3. Cria um revert commit na main
+#   4. O push na main dispara o workflow deploy-prd.yml automaticamente,
+#      que faz o deploy do estado revertido em PRD
+#   5. Comenta no PR original com o motivo do rollback
+#   6. Notifica branches abertas para rebase
+#
+# ATENÇÃO: O rollback cria um novo commit na main. A squad que sofreu
+#          o rollback deve corrigir o problema na feature branch e abrir
+#          um novo PR que inclua tanto a mudança original quanto a correção.
+###############################################################################
+
+name: Rollback PRD
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Número do PR a reverter (ex: 142)'
+        required: true
+        type: string
+      reason:
+        description: 'Motivo do rollback'
+        required: true
+        type: string
+
+jobs:
+  rollback:
+    name: Rollback Production Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Usa o mesmo environment PRD para exigir aprovação
+    environment: PRD
+
+    steps:
+      # -----------------------------------------------------------------
+      # 1. Checkout com PAT para permitir push na main protegida
+      # -----------------------------------------------------------------
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      # -----------------------------------------------------------------
+      # 2. Localizar o merge commit do PR
+      # -----------------------------------------------------------------
+      - name: Find merge commit
+        id: find
+        run: |
+          echo "Buscando merge commit do PR #${{ inputs.pr_number }}..."
+
+          MERGE_COMMIT=$(gh pr view ${{ inputs.pr_number }} \
+            --json mergeCommit -q '.mergeCommit.oid')
+
+          if [ -z "$MERGE_COMMIT" ]; then
+            echo "❌ PR #${{ inputs.pr_number }} não encontrado ou não foi mergeado."
+            exit 1
+          fi
+
+          PR_TITLE=$(gh pr view ${{ inputs.pr_number }} --json title -q '.title')
+          PR_AUTHOR=$(gh pr view ${{ inputs.pr_number }} --json author -q '.author.login')
+
+          echo "merge_commit=$MERGE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
+          echo "pr_author=$PR_AUTHOR" >> "$GITHUB_OUTPUT"
+
+          echo "========================================"
+          echo "PR: #${{ inputs.pr_number }} - $PR_TITLE"
+          echo "Autor: $PR_AUTHOR"
+          echo "Merge commit: $MERGE_COMMIT"
+          echo "Motivo rollback: ${{ inputs.reason }}"
+          echo "========================================"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------
+      # 3. Executar o revert do merge commit
+      #    -m 1 indica que estamos revertendo um merge commit
+      #    e queremos manter a main como parent
+      # -----------------------------------------------------------------
+      - name: Revert merge commit
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          echo "Revertendo commit ${{ steps.find.outputs.merge_commit }}..."
+
+          git revert -m 1 ${{ steps.find.outputs.merge_commit }} --no-edit
+
+          # Amend com mensagem detalhada
+          git commit --amend -m "revert: rollback PR #${{ inputs.pr_number }} - ${{ steps.find.outputs.pr_title }}
+
+          Motivo: ${{ inputs.reason }}
+          Commit revertido: ${{ steps.find.outputs.merge_commit }}
+          Autor original: ${{ steps.find.outputs.pr_author }}
+          Rollback executado por: ${{ github.actor }}"
+
+          git push origin main
+
+          echo "✅ Revert commitado e pushado na main."
+
+      # -----------------------------------------------------------------
+      # 4. Criar tag de rollback
+      # -----------------------------------------------------------------
+      - name: Tag rollback
+        run: |
+          TAG_NAME="rollback-pr${{ inputs.pr_number }}-$(date +%Y%m%d-%H%M%S)"
+
+          git tag -a "$TAG_NAME" -m "Rollback PR #${{ inputs.pr_number }}
+          Motivo: ${{ inputs.reason }}
+          Executado por: ${{ github.actor }}"
+
+          git push origin "$TAG_NAME"
+          echo "Tag criada: $TAG_NAME"
+
+      # -----------------------------------------------------------------
+      # 5. Comentar no PR original
+      # -----------------------------------------------------------------
+      - name: Notify on PR
+        run: |
+          gh pr comment ${{ inputs.pr_number }} \
+            --body "🔴 **ROLLBACK EXECUTADO**
+
+          | Item | Detalhe |
+          |------|---------|
+          | Motivo | ${{ inputs.reason }} |
+          | Executado por | @${{ github.actor }} |
+          | Data | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
+
+          **Próximos passos para a squad:**
+          1. Investigar o problema na feature branch
+          2. Corrigir o bug
+          3. Abrir **novo PR** com a mudança original + correção
+          4. Passar por todo o fluxo novamente (CI → UAT → GMUD → PRD)
+
+          ⚠️ O push do revert na main disparou automaticamente o deploy PRD
+          que vai restaurar o estado anterior em produção."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

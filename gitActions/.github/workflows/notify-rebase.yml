@@ -1,0 +1,94 @@
+###############################################################################
+# Notify Rebase Needed
+#
+# Gatilho: Push na branch main (após merge de PR)
+# Objetivo: Notificar todas as branches com PRs abertos que precisam
+#           fazer rebase da main para manter-se atualizadas
+#
+# Pré-requisitos:
+#   - Nenhum secret adicional necessário (usa GITHUB_TOKEN padrão)
+#
+# Comportamento:
+#   - Lista todos os PRs abertos apontando para main
+#   - Comenta em cada PR avisando que um novo merge ocorreu
+#   - Inclui instruções de rebase para o dev
+#   - O workflow de deploy-uat.yml bloqueia deploy se a branch
+#     não estiver atualizada, reforçando a necessidade do rebase
+###############################################################################
+
+name: Notify Rebase Needed
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'force-app/**'
+
+jobs:
+  notify:
+    name: Notify Open PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find and notify open PRs
+        run: |
+          # Identifica o PR que acabou de ser mergeado
+          COMMIT_MSG=$(git log -1 --format="%s")
+          MERGED_PR=$(echo "$COMMIT_MSG" | grep -oP '#\K[0-9]+' || echo "")
+
+          if [ -n "$MERGED_PR" ]; then
+            MERGED_TITLE=$(gh pr view "$MERGED_PR" --json title -q '.title' 2>/dev/null || echo "$COMMIT_MSG")
+            MERGED_INFO="PR #$MERGED_PR — $MERGED_TITLE"
+          else
+            MERGED_INFO="Commit: $(git log -1 --format='%h %s')"
+          fi
+
+          echo "Merge detectado: $MERGED_INFO"
+
+          # Lista PRs abertos para main
+          OPEN_PRS=$(gh pr list --base main --state open \
+            --json number,headRefName,author \
+            --jq '.[] | "\(.number)|\(.headRefName)|\(.author.login)"')
+
+          if [ -z "$OPEN_PRS" ]; then
+            echo "Nenhum PR aberto. Nada a notificar."
+            exit 0
+          fi
+
+          echo "PRs abertos encontrados:"
+          echo "$OPEN_PRS"
+
+          # Comenta em cada PR aberto
+          echo "$OPEN_PRS" | while IFS='|' read -r pr_num branch author; do
+            # Não notifica o PR que acabou de ser mergeado
+            if [ "$pr_num" == "$MERGED_PR" ]; then
+              continue
+            fi
+
+            echo "Notificando PR #$pr_num (branch: $branch, autor: @$author)..."
+
+            gh pr comment "$pr_num" \
+              --body "⚠️ **Rebase necessário**
+
+          Um novo merge foi realizado na main:
+          > $MERGED_INFO
+
+          Sua branch \`$branch\` precisa ser atualizada:
+          \`\`\`bash
+          git fetch origin main
+          git rebase origin/main
+          git push --force-with-lease
+          \`\`\`
+
+          ⛔ O deploy em UAT será **bloqueado** até o rebase ser concluído."
+          done
+
+          echo "✅ Notificações enviadas."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,80 @@
+###############################################################################
+# CI - Validate PR
+#
+# Gatilho: Abertura ou atualização de Pull Request para a branch main
+# Objetivo: Executar dry-run (validação) na org CI com testes locais Apex
+#           para garantir que o código está íntegro antes de qualquer deploy
+#
+# Pré-requisitos:
+#   - Secret SF_CI_AUTH_URL com a SFDX Auth URL da org CI
+#   - Org CI configurada e acessível
+###############################################################################
+
+name: CI - Validate PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'force-app/**'
+    types: [opened, synchronize, reopened]
+
+jobs:
+  validate:
+    name: Validate in CI Org
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # -----------------------------------------------------------------
+      # 1. Checkout do código
+      # -----------------------------------------------------------------
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------
+      # 2. Instalar Salesforce CLI
+      # -----------------------------------------------------------------
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      # -----------------------------------------------------------------
+      # 3. Autenticar na org CI usando SFDX Auth URL
+      #    A Auth URL é armazenada como secret no GitHub
+      #    Para gerar: sf org display --verbose --json | jq -r '.result.sfdxAuthUrl'
+      # -----------------------------------------------------------------
+      - name: Authenticate CI Org
+        run: |
+          echo "${{ secrets.SF_CI_AUTH_URL }}" > auth.url
+          sf org login sfdx-url --sfdx-url-file auth.url --alias ci-org
+          rm -f auth.url
+
+      # -----------------------------------------------------------------
+      # 4. Validação (dry-run) com testes locais
+      #    - Não faz deploy real, apenas valida
+      #    - Roda todos os testes locais (RunLocalTests)
+      #    - Timeout de 60 minutos
+      # -----------------------------------------------------------------
+      - name: Validate (Dry Run + Local Tests)
+        run: |
+          sf project deploy validate \
+            --source-dir force-app \
+            --target-org ci-org \
+            --test-level RunLocalTests \
+            --wait 60
+
+      # -----------------------------------------------------------------
+      # 5. Notificar resultado no PR em caso de falha
+      # -----------------------------------------------------------------
+      - name: Comment on PR if validation fails
+        if: failure()
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "❌ **CI Validation falhou.**
+
+          Verifique os logs do workflow para identificar o erro.
+          O deploy em UAT e o merge estão bloqueados até a correção."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

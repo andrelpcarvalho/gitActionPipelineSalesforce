@@ -1,0 +1,183 @@
+###############################################################################
+# Deploy PRD
+#
+# Gatilho: Push na branch main (após merge de PR)
+# Objetivo: Deployar o código em produção após todas as validações
+#
+# Pré-requisitos:
+#   - Secret SF_PRD_AUTH_URL com a SFDX Auth URL da org PRD
+#   - Environment "PRD" configurado no GitHub com aprovadores
+#   - Todas as validações anteriores devem ter passado:
+#     * CI (dry-run org CI)
+#     * 2 code reviews
+#     * Deploy UAT bem-sucedido
+#     * GMUD aprovada
+#
+# Comportamento:
+#   - O workflow é disparado automaticamente no merge
+#   - PARA e aguarda aprovação dos aprovadores do Environment PRD
+#   - Primeiro faz validate (dry-run) em PRD
+#   - Se o validate passa, faz o deploy real (quick deploy)
+#   - Cria uma tag com data/hora e número da GMUD para rastreabilidade
+#   - Notifica outras branches abertas para fazer rebase
+###############################################################################
+
+name: Deploy PRD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'force-app/**'
+
+jobs:
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    # -----------------------------------------------------------------------
+    # Environment PRD com aprovadores
+    # Configure em: Settings > Environments > PRD > Required reviewers
+    # O workflow PARA aqui e aguarda aprovação manual
+    # -----------------------------------------------------------------------
+    environment: PRD
+
+    steps:
+      # -----------------------------------------------------------------
+      # 1. Checkout do código (main após merge)
+      # -----------------------------------------------------------------
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------
+      # 2. Extrair informações do PR que gerou o merge
+      # -----------------------------------------------------------------
+      - name: Extract PR and GMUD info
+        id: info
+        run: |
+          # Identifica o PR que foi mergeado
+          COMMIT_MSG=$(git log -1 --format="%s")
+          PR_NUM=$(echo "$COMMIT_MSG" | grep -oP '#\K[0-9]+' || echo "unknown")
+
+          if [ "$PR_NUM" != "unknown" ]; then
+            GMUD=$(gh pr view "$PR_NUM" --json labels \
+              -q '.labels[].name' | grep -oP 'GMUD-\d+' || echo "SEM-GMUD")
+            PR_TITLE=$(gh pr view "$PR_NUM" --json title -q '.title')
+            PR_AUTHOR=$(gh pr view "$PR_NUM" --json author -q '.author.login')
+          else
+            GMUD="SEM-GMUD"
+            PR_TITLE="$COMMIT_MSG"
+            PR_AUTHOR="unknown"
+          fi
+
+          echo "pr_num=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "gmud=$GMUD" >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
+          echo "pr_author=$PR_AUTHOR" >> "$GITHUB_OUTPUT"
+
+          echo "========================================"
+          echo "PR: #$PR_NUM - $PR_TITLE"
+          echo "Autor: $PR_AUTHOR"
+          echo "GMUD: $GMUD"
+          echo "========================================"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------
+      # 3. Instalar Salesforce CLI
+      # -----------------------------------------------------------------
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      # -----------------------------------------------------------------
+      # 4. Autenticar na org PRD
+      # -----------------------------------------------------------------
+      - name: Authenticate PRD Org
+        run: |
+          echo "${{ secrets.SF_PRD_AUTH_URL }}" > auth.url
+          sf org login sfdx-url --sfdx-url-file auth.url --alias prd-org
+          rm -f auth.url
+
+      # -----------------------------------------------------------------
+      # 5. Validate (dry-run) em PRD
+      #    Executa a validação completa com testes antes do deploy real
+      #    Timeout de 120 minutos para orgs grandes
+      # -----------------------------------------------------------------
+      - name: Validate in PRD (Dry Run)
+        run: |
+          echo "Iniciando validação em PRD..."
+          sf project deploy validate \
+            --source-dir force-app \
+            --target-org prd-org \
+            --test-level RunLocalTests \
+            --wait 120
+
+      # -----------------------------------------------------------------
+      # 6. Deploy real (quick deploy)
+      #    Usa o resultado da validação anterior para deploy instantâneo
+      # -----------------------------------------------------------------
+      - name: Deploy to PRD (Quick Deploy)
+        run: |
+          echo "Validação OK. Executando quick deploy..."
+          sf project deploy quick \
+            --target-org prd-org \
+            --use-most-recent
+
+      # -----------------------------------------------------------------
+      # 7. Criar tag de deploy para rastreabilidade
+      #    Formato: prd-YYYYMMDD-HHMMSS
+      #    Inclui PR, GMUD e autor na mensagem
+      # -----------------------------------------------------------------
+      - name: Tag successful deploy
+        if: success()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          TAG_NAME="prd-$(date +%Y%m%d-%H%M%S)"
+
+          git tag -a "$TAG_NAME" -m "PRD Deploy
+          PR: #${{ steps.info.outputs.pr_num }} - ${{ steps.info.outputs.pr_title }}
+          Autor: ${{ steps.info.outputs.pr_author }}
+          GMUD: ${{ steps.info.outputs.gmud }}
+          Data: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          git push origin "$TAG_NAME"
+
+          echo "✅ Tag criada: $TAG_NAME"
+
+      # -----------------------------------------------------------------
+      # 8. Comentar no PR original
+      # -----------------------------------------------------------------
+      - name: Comment deploy result on PR
+        if: always()
+        run: |
+          PR_NUM="${{ steps.info.outputs.pr_num }}"
+          if [ "$PR_NUM" == "unknown" ]; then
+            exit 0
+          fi
+
+          if [ "${{ job.status }}" == "success" ]; then
+            gh pr comment "$PR_NUM" \
+              --body "🚀 **Deploy PRD realizado com sucesso!**
+
+          | Item | Detalhe |
+          |------|---------|
+          | GMUD | ${{ steps.info.outputs.gmud }} |
+          | Tag | prd-$(date +%Y%m%d-%H%M%S) |
+          | Data | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |"
+          else
+            gh pr comment "$PR_NUM" \
+              --body "❌ **Deploy PRD falhou.**
+
+          GMUD: ${{ steps.info.outputs.gmud }}
+          Verifique os logs do workflow para detalhes.
+
+          **Ação necessária:** Investigar a falha e, se necessário, executar rollback."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

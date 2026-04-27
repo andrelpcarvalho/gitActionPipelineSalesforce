@@ -1,0 +1,179 @@
+###############################################################################
+# GMUD Gate
+#
+# Gatilho: Quando uma label é adicionada/removida do PR, ou quando o PR
+#          é aberto/atualizado
+#
+# Objetivo: Validar que a homologação foi concluída E que uma GMUD aprovada
+#           está associada ao PR antes de permitir o merge na main.
+#           Funciona como Required Status Check.
+#
+# Pré-requisitos:
+#   - Label "homologado" no PR (adicionada pelo QA ou Tech Lead)
+#   - Label no formato GMUD-XXXX no PR (adicionada pelo Release Manager)
+#   - (Opcional) Secret GMUD_API_TOKEN para validação via API da ferramenta
+#   - Configurar "GMUD Gate / check-gmud" como Required Status Check
+#     em Settings > Branches > Branch protection rules > main
+#
+# Sequência esperada:
+#   1. Squad homologa em UAT
+#   2. QA/Tech Lead adiciona label "homologado"
+#   3. Dev abre GMUD na ferramenta de Change Management
+#   4. GMUD passa pelas aprovações internas e fórum do CoE
+#   5. Release Manager aprova e adiciona label GMUD-XXXX no PR
+#   6. Este workflow valida ambas as labels e habilita o merge
+#
+# O merge só é habilitado quando AMBAS as condições estão atendidas:
+#   - Label "homologado" presente
+#   - Label GMUD-XXXX presente (e opcionalmente validada via API)
+###############################################################################
+
+name: GMUD Gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled, unlabeled, opened, synchronize]
+
+jobs:
+  check-gmud:
+    name: Validate Homologation & GMUD
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # -----------------------------------------------------------------
+      # 1. Buscar todas as labels do PR
+      # -----------------------------------------------------------------
+      - name: Get PR labels
+        id: labels
+        run: |
+          LABELS=$(gh pr view ${{ github.event.pull_request.number }} \
+            --json labels -q '.labels[].name')
+
+          echo "Labels encontradas: $LABELS"
+          echo "all_labels<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$LABELS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------
+      # 2. Verificar label "homologado"
+      #    Deve ser adicionada pelo QA ou Tech Lead após homologação
+      #    bem-sucedida em UAT
+      # -----------------------------------------------------------------
+      - name: Check homologation label
+        id: homolog
+        run: |
+          LABELS="${{ steps.labels.outputs.all_labels }}"
+
+          HOMOLOGADO=$(echo "$LABELS" | grep -i 'homologado' || true)
+
+          if [ -z "$HOMOLOGADO" ]; then
+            echo "❌ Homologação não concluída."
+            echo ""
+            echo "A label 'homologado' precisa ser adicionada pelo QA ou Tech Lead"
+            echo "após a homologação bem-sucedida em UAT."
+            echo ""
+            echo "Status atual:"
+            echo "  [ ] homologado"
+            echo "  [ ] GMUD-XXXX"
+            echo "homologated=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "✅ Homologação confirmada."
+          echo "homologated=true" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # 3. Verificar label GMUD-XXXX
+      #    Deve ser adicionada pelo Release Manager após aprovação
+      #    da GMUD no fórum do CoE
+      # -----------------------------------------------------------------
+      - name: Check GMUD label
+        id: gmud
+        if: steps.homolog.outputs.homologated == 'true'
+        run: |
+          LABELS="${{ steps.labels.outputs.all_labels }}"
+
+          # Busca label no formato GMUD-XXXX (números)
+          GMUD=$(echo "$LABELS" | grep -oP 'GMUD-\d+' || true)
+
+          if [ -z "$GMUD" ]; then
+            echo "❌ Nenhuma GMUD associada a este PR."
+            echo ""
+            echo "Homologação OK, mas a GMUD ainda precisa ser aprovada."
+            echo ""
+            echo "Próximos passos:"
+            echo "  1. Dev/Tech Lead abre GMUD na ferramenta de Change Management"
+            echo "  2. GMUD passa pelas aprovações internas"
+            echo "  3. GMUD é apresentada no fórum do CoE"
+            echo "  4. Release Manager aprova e adiciona a label GMUD-XXXX neste PR"
+            echo ""
+            echo "Status atual:"
+            echo "  [x] homologado"
+            echo "  [ ] GMUD-XXXX"
+            echo "gmud_found=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          GMUD_NUMBER=$(echo "$GMUD" | grep -oP '\d+')
+          echo "✅ GMUD encontrada: $GMUD"
+          echo "gmud=$GMUD" >> "$GITHUB_OUTPUT"
+          echo "gmud_number=$GMUD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "gmud_found=true" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # 4. (Opcional) Validar GMUD na ferramenta via API
+      #
+      #    Descomente este step se sua ferramenta de GMUD possui API REST.
+      #    Ajuste a URL e o formato da resposta conforme sua ferramenta.
+      #
+      #    Se sua ferramenta não tem API, a validação por label é
+      #    suficiente — o Release Manager é responsável por adicionar
+      #    a label somente após aprovação no CoE.
+      # -----------------------------------------------------------------
+      # - name: Validate GMUD status via API
+      #   if: steps.gmud.outputs.gmud_found == 'true'
+      #   run: |
+      #     GMUD_NUMBER="${{ steps.gmud.outputs.gmud_number }}"
+      #
+      #     # Ajuste a URL para sua ferramenta de GMUD
+      #     RESPONSE=$(curl -s -f \
+      #       -H "Authorization: Bearer ${{ secrets.GMUD_API_TOKEN }}" \
+      #       -H "Content-Type: application/json" \
+      #       "https://sua-ferramenta-gmud.com/api/changes/${GMUD_NUMBER}")
+      #
+      #     STATUS=$(echo "$RESPONSE" | jq -r '.status')
+      #     APPROVER=$(echo "$RESPONSE" | jq -r '.approvedBy')
+      #     APPROVED_AT=$(echo "$RESPONSE" | jq -r '.approvedAt')
+      #
+      #     echo "GMUD: ${{ steps.gmud.outputs.gmud }}"
+      #     echo "Status: $STATUS"
+      #     echo "Aprovador: $APPROVER"
+      #     echo "Data aprovação: $APPROVED_AT"
+      #
+      #     if [ "$STATUS" != "APPROVED" ]; then
+      #       echo "❌ GMUD ${{ steps.gmud.outputs.gmud }} não está aprovada."
+      #       echo "Status atual: $STATUS"
+      #       echo "A GMUD precisa ser aprovada no fórum do CoE."
+      #       exit 1
+      #     fi
+      #
+      #     echo "✅ GMUD ${{ steps.gmud.outputs.gmud }} aprovada por $APPROVER em $APPROVED_AT"
+
+      # -----------------------------------------------------------------
+      # 5. Resultado final — ambas as validações passaram
+      # -----------------------------------------------------------------
+      - name: All validations passed
+        if: steps.homolog.outputs.homologated == 'true' && steps.gmud.outputs.gmud_found == 'true'
+        run: |
+          echo "========================================"
+          echo "✅ Todas as validações passaram!"
+          echo ""
+          echo "  [x] homologado"
+          echo "  [x] ${{ steps.gmud.outputs.gmud }}"
+          echo ""
+          echo "Merge habilitado."
+          echo "========================================"

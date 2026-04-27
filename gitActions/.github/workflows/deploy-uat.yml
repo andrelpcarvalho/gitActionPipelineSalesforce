@@ -1,0 +1,172 @@
+###############################################################################
+# Deploy UAT
+#
+# Gatilho: Automático quando o PR recebe a segunda aprovação de code review
+#          E o CI já passou com sucesso
+#
+# Objetivo: Deployar a feature branch em UAT para homologação da squad
+#
+# Pré-requisitos:
+#   - Secret SF_UAT_AUTH_URL com a SFDX Auth URL da org UAT
+#   - CI (ci-validate) deve ter passado
+#   - Mínimo de 2 aprovações de code review no PR
+#   - Branch deve estar atualizada com a main (rebase)
+#
+# Comportamento:
+#   - A cada nova aprovação de review, verifica se todas as condições
+#     foram atendidas (CI ok + 2 reviews + rebase ok)
+#   - Se todas as condições forem atendidas, executa o deploy em UAT
+#   - Comenta no PR o resultado do deploy
+###############################################################################
+
+name: Deploy UAT
+
+on:
+  pull_request_review:
+    types: [submitted]
+    branches: [main]
+
+jobs:
+  check-and-deploy:
+    name: Validate Conditions & Deploy UAT
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    # Só executa se o review foi uma aprovação
+    if: github.event.review.state == 'approved'
+
+    steps:
+      # -----------------------------------------------------------------
+      # 1. Verificar se o PR atende todas as condições para deploy UAT
+      #    - CI passou
+      #    - 2 aprovações de code review
+      # -----------------------------------------------------------------
+      - name: Check PR readiness
+        id: check
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          echo "Verificando PR #$PR_NUM..."
+
+          # Verifica CI status
+          CI_STATUS=$(gh pr checks "$PR_NUM" --json name,state \
+            --jq '.[] | select(.name == "Validate in CI Org") | .state')
+
+          if [ "$CI_STATUS" != "SUCCESS" ]; then
+            echo "❌ CI não passou ainda. Deploy UAT bloqueado."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "✅ CI passou."
+
+          # Conta aprovações (apenas APPROVED, ignora CHANGES_REQUESTED)
+          APPROVALS=$(gh pr view "$PR_NUM" --json reviews \
+            --jq '[.reviews[] | select(.state == "APPROVED")] | unique_by(.author.login) | length')
+
+          echo "Aprovações: $APPROVALS/2"
+
+          if [ "$APPROVALS" -lt 2 ]; then
+            echo "⏳ Faltam $(( 2 - APPROVALS )) aprovação(ões). Deploy UAT aguardando."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "✅ CI ok + $APPROVALS aprovações. Pronto para UAT."
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------
+      # 2. Checkout do código da feature branch
+      # -----------------------------------------------------------------
+      - name: Checkout source code
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------
+      # 3. Verificar se a branch está atualizada com a main
+      #    Se não estiver, bloqueia o deploy e avisa no PR
+      # -----------------------------------------------------------------
+      - name: Check rebase status
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          git fetch origin main
+          BEHIND=$(git rev-list --count HEAD..origin/main)
+
+          if [ "$BEHIND" -gt 0 ]; then
+            echo "❌ Branch está $BEHIND commits atrás da main."
+            gh pr comment ${{ github.event.pull_request.number }} \
+              --body "⚠️ **Deploy UAT bloqueado:** branch está $BEHIND commits atrás da main.
+
+          Execute o rebase antes de prosseguir:
+          \`\`\`bash
+          git fetch origin main
+          git rebase origin/main
+          git push --force-with-lease
+          \`\`\`"
+            exit 1
+          fi
+          echo "✅ Branch está atualizada com a main."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------
+      # 4. Instalar Salesforce CLI
+      # -----------------------------------------------------------------
+      - name: Install Salesforce CLI
+        if: steps.check.outputs.ready == 'true'
+        run: npm install -g @salesforce/cli
+
+      # -----------------------------------------------------------------
+      # 5. Autenticar na org UAT
+      # -----------------------------------------------------------------
+      - name: Authenticate UAT Org
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          echo "${{ secrets.SF_UAT_AUTH_URL }}" > auth.url
+          sf org login sfdx-url --sfdx-url-file auth.url --alias uat-org
+          rm -f auth.url
+
+      # -----------------------------------------------------------------
+      # 6. Deploy em UAT com testes locais
+      # -----------------------------------------------------------------
+      - name: Deploy to UAT
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          sf project deploy start \
+            --source-dir force-app \
+            --target-org uat-org \
+            --test-level RunLocalTests \
+            --wait 60
+
+      # -----------------------------------------------------------------
+      # 7. Comentar no PR o resultado do deploy
+      # -----------------------------------------------------------------
+      - name: Comment success on PR
+        if: steps.check.outputs.ready == 'true' && success()
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "✅ **Deploy UAT realizado com sucesso.**
+
+          Ambiente pronto para homologação.
+
+          **Próximos passos:**
+          1. Squad realiza homologação em UAT
+          2. Após aprovação, abrir GMUD na ferramenta de Change Management
+          3. Release Manager aprova a GMUD e adiciona label \`GMUD-XXXX\` no PR
+          4. Merge habilitado → Deploy PRD automático"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Comment failure on PR
+        if: steps.check.outputs.ready == 'true' && failure()
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "❌ **Deploy UAT falhou.**
+
+          Verifique os logs do workflow para identificar o erro.
+          Corrija o problema, faça push e aguarde novo ciclo de validação."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
