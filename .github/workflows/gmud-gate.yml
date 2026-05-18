@@ -49,6 +49,7 @@ jobs:
         id: labels
         run: |
           LABELS=$(gh pr view ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
             --json labels -q '.labels[].name')
 
           echo "Labels encontradas: $LABELS"
