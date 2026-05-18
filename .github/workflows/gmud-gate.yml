@@ -40,26 +40,22 @@ jobs:
     name: Validate Homologation & GMUD
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      pull-requests: read  # 👈 adiciona isso
 
     steps:
       # -----------------------------------------------------------------
-      # 1. Buscar todas as labels do PR
+      # 1. Buscar todas as labels do PR direto do payload do evento
+      #    Sem chamada à API — sem risco de erro de permissão
       # -----------------------------------------------------------------
       - name: Get PR labels
         id: labels
         run: |
-          LABELS=$(gh pr view ${{ github.event.pull_request.number }} \
-            --repo ${{ github.repository }} \
-            --json labels -q '.labels[].name')
+          LABELS=$(echo '${{ toJSON(github.event.pull_request.labels) }}' \
+            | jq -r '.[].name')
 
           echo "Labels encontradas: $LABELS"
           echo "all_labels<<EOF" >> "$GITHUB_OUTPUT"
           echo "$LABELS" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # -----------------------------------------------------------------
       # 2. Verificar label "homologado"
