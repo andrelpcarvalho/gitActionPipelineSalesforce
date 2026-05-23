@@ -1,8 +1,8 @@
 ###############################################################################
 # Deploy UAT
 #
-# Gatilho: Automático quando o PR recebe a segunda aprovação de code review
-#          E o CI já passou com sucesso
+# Gatilho: Automático quando o PR (para release/*) recebe a segunda
+#          aprovação de code review E o CI já passou com sucesso
 #
 # Objetivo: Deployar a feature branch em UAT para homologação da squad
 #
@@ -10,13 +10,11 @@
 #   - Secret SF_UAT_AUTH_URL com a SFDX Auth URL da org UAT
 #   - CI (ci-validate) deve ter passado
 #   - Mínimo de 2 aprovações de code review no PR
-#   - Branch deve estar atualizada com a main (rebase)
+#   - Branch deve estar atualizada com a release branch (rebase)
 #
-# Comportamento:
-#   - A cada nova aprovação de review, verifica se todas as condições
-#     foram atendidas (CI ok + 2 reviews + rebase ok)
-#   - Se todas as condições forem atendidas, executa o deploy em UAT
-#   - Comenta no PR o resultado do deploy
+# Modelo Release Branch:
+#   Cada squad abre PR para release/* e deploya em UAT individualmente.
+#   A homologação é feita por squad, no ritmo de cada time.
 ###############################################################################
 
 name: Deploy UAT
@@ -24,7 +22,6 @@ name: Deploy UAT
 on:
   pull_request_review:
     types: [submitted]
-    branches: [main]
 
 jobs:
   check-and-deploy:
@@ -32,8 +29,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
-    # Só executa se o review foi uma aprovação
-    if: github.event.review.state == 'approved'
+    # Só executa se o review foi aprovação E o PR aponta para release/*
+    if: >
+      github.event.review.state == 'approved' &&
+      startsWith(github.event.pull_request.base.ref, 'release/')
 
     steps:
       # -----------------------------------------------------------------
@@ -48,7 +47,9 @@ jobs:
           echo "Verificando PR #$PR_NUM..."
 
           # Verifica CI status
-          CI_STATUS=$(gh pr checks "$PR_NUM" --json name,state \
+          CI_STATUS=$(gh pr checks "$PR_NUM" \
+            --repo ${{ github.repository }} \
+            --json name,state \
             --jq '.[] | select(.name == "Validate in CI Org") | .state')
 
           if [ "$CI_STATUS" != "SUCCESS" ]; then
@@ -59,7 +60,9 @@ jobs:
           echo "✅ CI passou."
 
           # Conta aprovações (apenas APPROVED, ignora CHANGES_REQUESTED)
-          APPROVALS=$(gh pr view "$PR_NUM" --json reviews \
+          APPROVALS=$(gh pr view "$PR_NUM" \
+            --repo ${{ github.repository }} \
+            --json reviews \
             --jq '[.reviews[] | select(.state == "APPROVED")] | unique_by(.author.login) | length')
 
           echo "Aprovações: $APPROVALS/2"
@@ -86,29 +89,31 @@ jobs:
           fetch-depth: 0
 
       # -----------------------------------------------------------------
-      # 3. Verificar se a branch está atualizada com a main
+      # 3. Verificar se a branch está atualizada com a release branch
       #    Se não estiver, bloqueia o deploy e avisa no PR
       # -----------------------------------------------------------------
       - name: Check rebase status
         if: steps.check.outputs.ready == 'true'
         run: |
-          git fetch origin main
-          BEHIND=$(git rev-list --count HEAD..origin/main)
+          RELEASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+          git fetch origin "$RELEASE_BRANCH"
+          BEHIND=$(git rev-list --count "HEAD..origin/$RELEASE_BRANCH")
 
           if [ "$BEHIND" -gt 0 ]; then
-            echo "❌ Branch está $BEHIND commits atrás da main."
+            echo "❌ Branch está $BEHIND commits atrás da $RELEASE_BRANCH."
             gh pr comment ${{ github.event.pull_request.number }} \
-              --body "⚠️ **Deploy UAT bloqueado:** branch está $BEHIND commits atrás da main.
+              --repo ${{ github.repository }} \
+              --body "⚠️ **Deploy UAT bloqueado:** branch está $BEHIND commits atrás da \`$RELEASE_BRANCH\`.
 
           Execute o rebase antes de prosseguir:
           \`\`\`bash
-          git fetch origin main
-          git rebase origin/main
+          git fetch origin $RELEASE_BRANCH
+          git rebase origin/$RELEASE_BRANCH
           git push --force-with-lease
           \`\`\`"
             exit 1
           fi
-          echo "✅ Branch está atualizada com a main."
+          echo "✅ Branch está atualizada com a $RELEASE_BRANCH."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -147,16 +152,21 @@ jobs:
       - name: Comment success on PR
         if: steps.check.outputs.ready == 'true' && success()
         run: |
+          RELEASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+
           gh pr comment ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
             --body "✅ **Deploy UAT realizado com sucesso.**
 
           Ambiente pronto para homologação.
 
           **Próximos passos:**
           1. Squad realiza homologação em UAT
-          2. Após aprovação, abrir GMUD na ferramenta de Change Management
-          3. Release Manager aprova a GMUD e adiciona label \`GMUD-XXXX\` no PR
-          4. Merge habilitado → Deploy PRD automático"
+          2. QA/Tech Lead adiciona label \`homologado\`
+          3. Dev/Tech Lead abre GMUD na ferramenta de Change Management
+          4. Release Manager aprova a GMUD e adiciona label \`GMUD-XXXX\` no PR
+          5. Merge na \`$RELEASE_BRANCH\` habilitado
+          6. No dia do deploy, Release Manager mergeia \`$RELEASE_BRANCH\` → \`main\` → Deploy PRD"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -164,6 +174,7 @@ jobs:
         if: steps.check.outputs.ready == 'true' && failure()
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
             --body "❌ **Deploy UAT falhou.**
 
           Verifique os logs do workflow para identificar o erro.

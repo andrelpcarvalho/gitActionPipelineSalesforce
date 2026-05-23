@@ -1,25 +1,23 @@
 ###############################################################################
 # Deploy PRD
 #
-# Gatilho: Push na branch main (após merge de PR)
+# Gatilho: Push na branch main (após merge da release branch)
 # Objetivo: Deployar o código em produção após todas as validações
 #
 # Pré-requisitos:
 #   - Secret SF_PRD_AUTH_URL com a SFDX Auth URL da org PRD
 #   - Environment "PRD" configurado no GitHub com aprovadores
-#   - Todas as validações anteriores devem ter passado:
+#   - Todas as validações anteriores devem ter passado nos PRs individuais:
 #     * CI (dry-run org CI)
-#     * 2 code reviews
-#     * Deploy UAT bem-sucedido
-#     * GMUD aprovada
+#     * 2 code reviews por PR
+#     * Deploy UAT bem-sucedido por squad
+#     * GMUD aprovada por PR
+#   - Release branch mergeada na main pelo Release Manager
 #
-# Comportamento:
-#   - O workflow é disparado automaticamente no merge
-#   - PARA e aguarda aprovação dos aprovadores do Environment PRD
-#   - Primeiro faz validate (dry-run) em PRD
-#   - Se o validate passa, faz o deploy real (quick deploy)
-#   - Cria uma tag com data/hora e número da GMUD para rastreabilidade
-#   - Notifica outras branches abertas para fazer rebase
+# Modelo Release Branch:
+#   O Release Manager mergeia a release branch (ex: release/2026-05-23)
+#   na main no dia do deploy. Esse merge dispara este workflow.
+#   A tag inclui quem aprovou, a data e as GMUDs incluídas.
 ###############################################################################
 
 name: Deploy PRD
@@ -45,7 +43,7 @@ jobs:
 
     steps:
       # -----------------------------------------------------------------
-      # 1. Checkout do código (main após merge)
+      # 1. Checkout do código (main após merge da release branch)
       # -----------------------------------------------------------------
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -54,35 +52,74 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # -----------------------------------------------------------------
-      # 2. Extrair informações do PR que gerou o merge
+      # 2. Extrair informações do merge da release branch
+      #    Identifica o PR da release, as GMUDs incluídas e quem mergeou
       # -----------------------------------------------------------------
-      - name: Extract PR and GMUD info
+      - name: Extract release info
         id: info
         run: |
-          # Identifica o PR que foi mergeado
           COMMIT_MSG=$(git log -1 --format="%s")
+          echo "Commit: $COMMIT_MSG"
+
+          # Identifica o PR da release branch → main
           PR_NUM=$(echo "$COMMIT_MSG" | grep -oP '#\K[0-9]+' || echo "unknown")
 
           if [ "$PR_NUM" != "unknown" ]; then
-            GMUD=$(gh pr view "$PR_NUM" --json labels \
-              -q '.labels[].name' | grep -oP 'GMUD-\d+' || echo "SEM-GMUD")
-            PR_TITLE=$(gh pr view "$PR_NUM" --json title -q '.title')
-            PR_AUTHOR=$(gh pr view "$PR_NUM" --json author -q '.author.login')
+            PR_TITLE=$(gh pr view "$PR_NUM" \
+              --repo ${{ github.repository }} \
+              --json title -q '.title' 2>/dev/null || echo "$COMMIT_MSG")
+            MERGED_BY=$(gh pr view "$PR_NUM" \
+              --repo ${{ github.repository }} \
+              --json mergedBy -q '.mergedBy.login' 2>/dev/null || echo "unknown")
+
+            # Busca todas as GMUDs dos PRs que foram mergeados na release branch
+            RELEASE_BRANCH=$(gh pr view "$PR_NUM" \
+              --repo ${{ github.repository }} \
+              --json headRefName -q '.headRefName' 2>/dev/null || echo "unknown")
+
+            # Lista PRs mergeados na release branch e suas GMUDs
+            if [ "$RELEASE_BRANCH" != "unknown" ]; then
+              GMUDS=$(gh pr list \
+                --repo ${{ github.repository }} \
+                --base "$RELEASE_BRANCH" \
+                --state merged \
+                --json labels \
+                --jq '.[].labels[].name' 2>/dev/null | grep -oP 'GMUD-\d+' | sort -u || echo "SEM-GMUD")
+
+              PR_COUNT=$(gh pr list \
+                --repo ${{ github.repository }} \
+                --base "$RELEASE_BRANCH" \
+                --state merged \
+                --json number \
+                --jq 'length' 2>/dev/null || echo "0")
+            else
+              GMUDS="SEM-GMUD"
+              PR_COUNT="0"
+            fi
           else
-            GMUD="SEM-GMUD"
             PR_TITLE="$COMMIT_MSG"
-            PR_AUTHOR="unknown"
+            MERGED_BY="unknown"
+            RELEASE_BRANCH="unknown"
+            GMUDS="SEM-GMUD"
+            PR_COUNT="0"
           fi
 
           echo "pr_num=$PR_NUM" >> "$GITHUB_OUTPUT"
-          echo "gmud=$GMUD" >> "$GITHUB_OUTPUT"
           echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
-          echo "pr_author=$PR_AUTHOR" >> "$GITHUB_OUTPUT"
+          echo "merged_by=$MERGED_BY" >> "$GITHUB_OUTPUT"
+          echo "release_branch=$RELEASE_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "pr_count=$PR_COUNT" >> "$GITHUB_OUTPUT"
+
+          echo "gmuds<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$GMUDS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
           echo "========================================"
+          echo "Release: $RELEASE_BRANCH"
           echo "PR: #$PR_NUM - $PR_TITLE"
-          echo "Autor: $PR_AUTHOR"
-          echo "GMUD: $GMUD"
+          echo "Mergeado por: $MERGED_BY"
+          echo "PRs incluídos: $PR_COUNT"
+          echo "GMUDs: $GMUDS"
           echo "========================================"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -129,8 +166,7 @@ jobs:
 
       # -----------------------------------------------------------------
       # 7. Criar tag de deploy para rastreabilidade
-      #    Formato: prd-YYYYMMDD-HHMMSS
-      #    Inclui PR, GMUD e autor na mensagem
+      #    Inclui: release branch, aprovador, data, GMUDs e total de PRs
       # -----------------------------------------------------------------
       - name: Tag successful deploy
         if: success()
@@ -139,11 +175,14 @@ jobs:
           git config user.email "actions@github.com"
 
           TAG_NAME="prd-$(date +%Y%m%d-%H%M%S)"
+          GMUDS="${{ steps.info.outputs.gmuds }}"
 
           git tag -a "$TAG_NAME" -m "PRD Deploy
+          Release: ${{ steps.info.outputs.release_branch }}
           PR: #${{ steps.info.outputs.pr_num }} - ${{ steps.info.outputs.pr_title }}
-          Autor: ${{ steps.info.outputs.pr_author }}
-          GMUD: ${{ steps.info.outputs.gmud }}
+          Aprovado por: ${{ steps.info.outputs.merged_by }}
+          PRs incluídos: ${{ steps.info.outputs.pr_count }}
+          GMUDs: $GMUDS
           Data: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
           git push origin "$TAG_NAME"
@@ -151,7 +190,7 @@ jobs:
           echo "✅ Tag criada: $TAG_NAME"
 
       # -----------------------------------------------------------------
-      # 8. Comentar no PR original
+      # 8. Comentar no PR da release branch
       # -----------------------------------------------------------------
       - name: Comment deploy result on PR
         if: always()
@@ -161,20 +200,28 @@ jobs:
             exit 0
           fi
 
+          GMUDS="${{ steps.info.outputs.gmuds }}"
+
           if [ "${{ job.status }}" == "success" ]; then
             gh pr comment "$PR_NUM" \
+              --repo ${{ github.repository }} \
               --body "🚀 **Deploy PRD realizado com sucesso!**
 
           | Item | Detalhe |
           |------|---------|
-          | GMUD | ${{ steps.info.outputs.gmud }} |
-          | Tag | prd-$(date +%Y%m%d-%H%M%S) |
+          | Release | \`${{ steps.info.outputs.release_branch }}\` |
+          | Aprovado por | @${{ steps.info.outputs.merged_by }} |
+          | PRs incluídos | ${{ steps.info.outputs.pr_count }} |
+          | GMUDs | $GMUDS |
+          | Tag | \`prd-$(date +%Y%m%d-%H%M%S)\` |
           | Data | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |"
           else
             gh pr comment "$PR_NUM" \
+              --repo ${{ github.repository }} \
               --body "❌ **Deploy PRD falhou.**
 
-          GMUD: ${{ steps.info.outputs.gmud }}
+          Release: \`${{ steps.info.outputs.release_branch }}\`
+          GMUDs: $GMUDS
           Verifique os logs do workflow para detalhes.
 
           **Ação necessária:** Investigar a falha e, se necessário, executar rollback."

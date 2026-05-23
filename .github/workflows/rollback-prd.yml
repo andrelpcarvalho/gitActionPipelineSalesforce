@@ -2,26 +2,23 @@
 # Rollback PRD
 #
 # Gatilho: Manual (workflow_dispatch)
-# Objetivo: Reverter um PR específico da main, desfazendo o deploy em PRD
+# Objetivo: Reverter o merge da release branch na main, desfazendo o deploy
 #
 # Pré-requisitos:
 #   - Secret GH_PAT com Personal Access Token que tenha permissão de push
 #     em branches protegidas (necessário para push direto na main)
 #   - Environment PRD configurado com aprovadores
-#   - O PR a ser revertido deve ter sido mergeado na main
+#   - A release branch deve ter sido mergeada na main
 #
-# Comportamento:
-#   1. Recebe o número do PR e o motivo do rollback
-#   2. Localiza o merge commit do PR
-#   3. Cria um revert commit na main
-#   4. O push na main dispara o workflow deploy-prd.yml automaticamente,
-#      que faz o deploy do estado revertido em PRD
-#   5. Comenta no PR original com o motivo do rollback
-#   6. Notifica branches abertas para rebase
+# Modelo Release Branch:
+#   O rollback reverte o merge commit da release branch inteira.
+#   Isso desfaz TODOS os PRs que estavam na release.
+#   O push do revert na main dispara o deploy-prd automaticamente,
+#   restaurando o estado anterior em produção.
 #
-# ATENÇÃO: O rollback cria um novo commit na main. A squad que sofreu
-#          o rollback deve corrigir o problema na feature branch e abrir
-#          um novo PR que inclua tanto a mudança original quanto a correção.
+# ATENÇÃO: O rollback reverte a release INTEIRA, não PRs individuais.
+#          Para corrigir, as squads devem abrir novos PRs em uma nova
+#          release branch com as correções necessárias.
 ###############################################################################
 
 name: Rollback PRD
@@ -30,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'Número do PR a reverter (ex: 142)'
+        description: 'Número do PR da release branch (ex: 50)'
         required: true
         type: string
       reason:
@@ -58,7 +55,7 @@ jobs:
           token: ${{ secrets.GH_PAT }}
 
       # -----------------------------------------------------------------
-      # 2. Localizar o merge commit do PR
+      # 2. Localizar o merge commit da release branch
       # -----------------------------------------------------------------
       - name: Find merge commit
         id: find
@@ -66,6 +63,7 @@ jobs:
           echo "Buscando merge commit do PR #${{ inputs.pr_number }}..."
 
           MERGE_COMMIT=$(gh pr view ${{ inputs.pr_number }} \
+            --repo ${{ github.repository }} \
             --json mergeCommit -q '.mergeCommit.oid')
 
           if [ -z "$MERGE_COMMIT" ]; then
@@ -73,16 +71,25 @@ jobs:
             exit 1
           fi
 
-          PR_TITLE=$(gh pr view ${{ inputs.pr_number }} --json title -q '.title')
-          PR_AUTHOR=$(gh pr view ${{ inputs.pr_number }} --json author -q '.author.login')
+          PR_TITLE=$(gh pr view ${{ inputs.pr_number }} \
+            --repo ${{ github.repository }} \
+            --json title -q '.title')
+          RELEASE_BRANCH=$(gh pr view ${{ inputs.pr_number }} \
+            --repo ${{ github.repository }} \
+            --json headRefName -q '.headRefName')
+          MERGED_BY=$(gh pr view ${{ inputs.pr_number }} \
+            --repo ${{ github.repository }} \
+            --json mergedBy -q '.mergedBy.login')
 
           echo "merge_commit=$MERGE_COMMIT" >> "$GITHUB_OUTPUT"
           echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
-          echo "pr_author=$PR_AUTHOR" >> "$GITHUB_OUTPUT"
+          echo "release_branch=$RELEASE_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "merged_by=$MERGED_BY" >> "$GITHUB_OUTPUT"
 
           echo "========================================"
           echo "PR: #${{ inputs.pr_number }} - $PR_TITLE"
-          echo "Autor: $PR_AUTHOR"
+          echo "Release: $RELEASE_BRANCH"
+          echo "Mergeado por: $MERGED_BY"
           echo "Merge commit: $MERGE_COMMIT"
           echo "Motivo rollback: ${{ inputs.reason }}"
           echo "========================================"
@@ -104,11 +111,12 @@ jobs:
           git revert -m 1 ${{ steps.find.outputs.merge_commit }} --no-edit
 
           # Amend com mensagem detalhada
-          git commit --amend -m "revert: rollback PR #${{ inputs.pr_number }} - ${{ steps.find.outputs.pr_title }}
+          git commit --amend -m "revert: rollback ${{ steps.find.outputs.release_branch }} (PR #${{ inputs.pr_number }})
 
           Motivo: ${{ inputs.reason }}
+          Release: ${{ steps.find.outputs.release_branch }}
           Commit revertido: ${{ steps.find.outputs.merge_commit }}
-          Autor original: ${{ steps.find.outputs.pr_author }}
+          Merge original por: ${{ steps.find.outputs.merged_by }}
           Rollback executado por: ${{ github.actor }}"
 
           git push origin main
@@ -120,9 +128,10 @@ jobs:
       # -----------------------------------------------------------------
       - name: Tag rollback
         run: |
-          TAG_NAME="rollback-pr${{ inputs.pr_number }}-$(date +%Y%m%d-%H%M%S)"
+          TAG_NAME="rollback-$(echo '${{ steps.find.outputs.release_branch }}' | tr '/' '-')-$(date +%Y%m%d-%H%M%S)"
 
-          git tag -a "$TAG_NAME" -m "Rollback PR #${{ inputs.pr_number }}
+          git tag -a "$TAG_NAME" -m "Rollback ${{ steps.find.outputs.release_branch }}
+          PR: #${{ inputs.pr_number }}
           Motivo: ${{ inputs.reason }}
           Executado por: ${{ github.actor }}"
 
@@ -130,23 +139,25 @@ jobs:
           echo "Tag criada: $TAG_NAME"
 
       # -----------------------------------------------------------------
-      # 5. Comentar no PR original
+      # 5. Comentar no PR da release branch
       # -----------------------------------------------------------------
       - name: Notify on PR
         run: |
           gh pr comment ${{ inputs.pr_number }} \
+            --repo ${{ github.repository }} \
             --body "🔴 **ROLLBACK EXECUTADO**
 
           | Item | Detalhe |
           |------|---------|
+          | Release | \`${{ steps.find.outputs.release_branch }}\` |
           | Motivo | ${{ inputs.reason }} |
           | Executado por | @${{ github.actor }} |
           | Data | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
 
-          **Próximos passos para a squad:**
-          1. Investigar o problema na feature branch
-          2. Corrigir o bug
-          3. Abrir **novo PR** com a mudança original + correção
+          **Próximos passos:**
+          1. Investigar o problema
+          2. Criar nova release branch (ex: \`release/hotfix-YYYY-MM-DD\`)
+          3. Squads abrem novos PRs com as correções
           4. Passar por todo o fluxo novamente (CI → UAT → GMUD → PRD)
 
           ⚠️ O push do revert na main disparou automaticamente o deploy PRD

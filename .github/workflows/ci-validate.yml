@@ -1,20 +1,24 @@
 ###############################################################################
 # CI - Validate PR
 #
-# Gatilho: Abertura ou atualização de Pull Request para a branch main
+# Gatilho: Abertura ou atualização de Pull Request para uma branch release/*
 # Objetivo: Executar dry-run (validação) na org CI com testes locais Apex
 #           para garantir que o código está íntegro antes de qualquer deploy
 #
 # Pré-requisitos:
 #   - Secret SF_CI_AUTH_URL com a SFDX Auth URL da org CI
 #   - Org CI configurada e acessível
+#
+# Modelo Release Branch:
+#   Cada squad abre seu PR apontando para release/* (ex: release/2026-05-23)
+#   O CI valida cada PR individualmente contra a release branch
 ###############################################################################
 
 name: CI - Validate PR
 
 on:
   pull_request:
-    branches: [main]
+    branches: ['release/*']
     paths:
       - 'force-app/**'
     types: [opened, synchronize, reopened]
@@ -72,9 +76,10 @@ jobs:
         if: failure()
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
             --body "❌ **CI Validation falhou.**
 
           Verifique os logs do workflow para identificar o erro.
-          O deploy em UAT e o merge estão bloqueados até a correção."
+          O deploy em UAT e o merge na release branch estão bloqueados até a correção."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
