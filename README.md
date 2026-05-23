@@ -2,7 +2,7 @@
 
 Este repositório utiliza um pipeline automatizado com GitHub Actions para validação, deploy e governança (GMUD).
 
-Documentação completa: [docs/pipeline-ci-cd.md](docs/pipeline-ci-cd.md)
+Documentação completa: [docs/pipeline-salesforce-docs.md](docs/pipeline-ci-cd.md)
 
 # Salesforce DX Project: Next Steps
 
