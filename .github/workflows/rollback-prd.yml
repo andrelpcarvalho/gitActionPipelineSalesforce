@@ -2,23 +2,31 @@
 # Rollback PRD
 #
 # Gatilho: Manual (workflow_dispatch)
-# Objetivo: Reverter o merge da release branch na main, desfazendo o deploy
+# Objetivo: Restaurar em produção o estado exato de uma versão anterior,
+#           identificada por TAG ou por "N releases atrás".
+#
+# Estratégia:
+#   Faz checkout do código na tag alvo e deploya diretamente em PRD,
+#   garantindo que o estado deployado corresponde 100% ao artefato ZIP
+#   daquela GitHub Release.
 #
 # Pré-requisitos:
-#   - Secret GH_PAT com Personal Access Token que tenha permissão de push
-#     em branches protegidas (necessário para push direto na main)
+#   - Secret SF_PRD_AUTH_URL com a SFDX Auth URL da org PRD
+#   - Secret GH_PAT com Personal Access Token (push em branch protegida)
 #   - Environment PRD configurado com aprovadores
-#   - A release branch deve ter sido mergeada na main
+#   - Tags de deploy existentes no formato v{YYYY}.{MM}.{DD}-{HHmm}
 #
-# Modelo Release Branch:
-#   O rollback reverte o merge commit da release branch inteira.
-#   Isso desfaz TODOS os PRs que estavam na release.
-#   O push do revert na main dispara o deploy-prd automaticamente,
-#   restaurando o estado anterior em produção.
+# Inputs:
+#   target_tag    — nome exato da tag (ex: v2026.06.10-1430)
+#                   Deixe vazio se preferir usar steps_back
+#   steps_back    — quantas releases voltar (1 = última, 2 = penúltima, ...)
+#                   Ignorado se target_tag for informado
+#   reason        — motivo obrigatório para auditoria
 #
-# ATENÇÃO: O rollback reverte a release INTEIRA, não PRs individuais.
-#          Para corrigir, as squads devem abrir novos PRs em uma nova
-#          release branch com as correções necessárias.
+# Exemplo de uso:
+#   Voltar 1 release → steps_back=1  (estado imediatamente anterior)
+#   Voltar 2 releases → steps_back=2
+#   Tag específica   → target_tag=v2026.06.09-0900
 ###############################################################################
 
 name: Rollback PRD
@@ -26,27 +34,32 @@ name: Rollback PRD
 on:
   workflow_dispatch:
     inputs:
-      pr_number:
-        description: 'Número do PR da release branch (ex: 50)'
-        required: true
+      target_tag:
+        description: 'Tag alvo do rollback (ex: v2026.06.10-1430). Deixe vazio para usar steps_back.'
+        required: false
         type: string
+        default: ''
+      steps_back:
+        description: 'Quantas releases voltar (1 = última, 2 = penúltima). Usado apenas se target_tag estiver vazio.'
+        required: false
+        type: string
+        default: '1'
       reason:
-        description: 'Motivo do rollback'
+        description: 'Motivo do rollback (obrigatório para auditoria)'
         required: true
         type: string
 
 jobs:
   rollback:
-    name: Rollback Production Deploy
+    name: Rollback Production to Previous Release
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
 
-    # Usa o mesmo environment PRD para exigir aprovação
     environment: PRD
 
     steps:
       # -----------------------------------------------------------------
-      # 1. Checkout com PAT para permitir push na main protegida
+      # 1. Checkout completo para acesso a todas as tags
       # -----------------------------------------------------------------
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -55,112 +68,191 @@ jobs:
           token: ${{ secrets.GH_PAT }}
 
       # -----------------------------------------------------------------
-      # 2. Localizar o merge commit da release branch
+      # 2. Resolver a tag alvo
+      #    - Se target_tag informado: usa diretamente
+      #    - Caso contrário: lista tags de deploy (v*) ordenadas por data
+      #      e seleciona a N-ésima mais recente conforme steps_back
       # -----------------------------------------------------------------
-      - name: Find merge commit
-        id: find
+      - name: Resolve target tag
+        id: resolve
         run: |
-          echo "Buscando merge commit do PR #${{ inputs.pr_number }}..."
+          TARGET_TAG="${{ inputs.target_tag }}"
 
-          MERGE_COMMIT=$(gh pr view ${{ inputs.pr_number }} \
-            --repo ${{ github.repository }} \
-            --json mergeCommit -q '.mergeCommit.oid')
+          if [ -n "$TARGET_TAG" ]; then
+            # Valida se a tag existe
+            if ! git tag -l "$TARGET_TAG" | grep -q "$TARGET_TAG"; then
+              echo "❌ Tag '$TARGET_TAG' não encontrada."
+              echo "Tags disponíveis:"
+              git tag -l 'v*' --sort=-version:refname | head -20
+              exit 1
+            fi
+            echo "Usando tag informada: $TARGET_TAG"
+          else
+            STEPS_BACK="${{ inputs.steps_back }}"
 
-          if [ -z "$MERGE_COMMIT" ]; then
-            echo "❌ PR #${{ inputs.pr_number }} não encontrado ou não foi mergeado."
-            exit 1
+            # Garante que steps_back é um número válido >= 1
+            if ! [[ "$STEPS_BACK" =~ ^[0-9]+$ ]] || [ "$STEPS_BACK" -lt 1 ]; then
+              echo "❌ steps_back deve ser um número >= 1. Recebido: '$STEPS_BACK'"
+              exit 1
+            fi
+
+            # Lista tags de deploy em ordem decrescente (mais recente primeiro)
+            # As tags de deploy seguem o padrão v{YYYY}.{MM}.{DD}-{HHmm}
+            TAGS=$(git tag -l 'v[0-9]*' --sort=-version:refname)
+            TOTAL=$(echo "$TAGS" | grep -c 'v' || true)
+
+            echo "Total de tags de deploy encontradas: $TOTAL"
+            echo "$TAGS" | head -10
+
+            if [ "$TOTAL" -lt "$STEPS_BACK" ]; then
+              echo "❌ Solicitado voltar $STEPS_BACK releases, mas só existem $TOTAL tags disponíveis."
+              exit 1
+            fi
+
+            TARGET_TAG=$(echo "$TAGS" | sed -n "${STEPS_BACK}p")
+            echo "Resolvido via steps_back=$STEPS_BACK → tag: $TARGET_TAG"
           fi
 
-          PR_TITLE=$(gh pr view ${{ inputs.pr_number }} \
-            --repo ${{ github.repository }} \
-            --json title -q '.title')
-          RELEASE_BRANCH=$(gh pr view ${{ inputs.pr_number }} \
-            --repo ${{ github.repository }} \
-            --json headRefName -q '.headRefName')
-          MERGED_BY=$(gh pr view ${{ inputs.pr_number }} \
-            --repo ${{ github.repository }} \
-            --json mergedBy -q '.mergedBy.login')
+          # Captura metadados da tag
+          TAG_MESSAGE=$(git tag -l --format='%(contents)' "$TARGET_TAG" | head -10 || echo "sem mensagem")
+          TAG_DATE=$(git log -1 --format="%ai" "$TARGET_TAG" 2>/dev/null || echo "desconhecida")
 
-          echo "merge_commit=$MERGE_COMMIT" >> "$GITHUB_OUTPUT"
-          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
-          echo "release_branch=$RELEASE_BRANCH" >> "$GITHUB_OUTPUT"
-          echo "merged_by=$MERGED_BY" >> "$GITHUB_OUTPUT"
+          echo "target_tag=$TARGET_TAG"   >> "$GITHUB_OUTPUT"
+          echo "tag_date=$TAG_DATE"       >> "$GITHUB_OUTPUT"
 
           echo "========================================"
-          echo "PR: #${{ inputs.pr_number }} - $PR_TITLE"
-          echo "Release: $RELEASE_BRANCH"
-          echo "Mergeado por: $MERGED_BY"
-          echo "Merge commit: $MERGE_COMMIT"
-          echo "Motivo rollback: ${{ inputs.reason }}"
+          echo "Tag alvo   : $TARGET_TAG"
+          echo "Data da tag: $TAG_DATE"
+          echo "Motivo     : ${{ inputs.reason }}"
+          echo "Solicitado por: ${{ github.actor }}"
           echo "========================================"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo ""
+          echo "Metadados da tag:"
+          echo "$TAG_MESSAGE"
 
       # -----------------------------------------------------------------
-      # 3. Executar o revert do merge commit
-      #    -m 1 indica que estamos revertendo um merge commit
-      #    e queremos manter a main como parent
+      # 3. Fazer checkout exato do código na tag alvo
+      #    O force-app ficará no estado idêntico ao do deploy original
       # -----------------------------------------------------------------
-      - name: Revert merge commit
+      - name: Checkout code at target tag
         run: |
+          git checkout "${{ steps.resolve.outputs.target_tag }}"
+          echo "✅ Código restaurado para ${{ steps.resolve.outputs.target_tag }}"
+          echo "Arquivos em force-app: $(find force-app -type f | wc -l)"
+
+      # -----------------------------------------------------------------
+      # 4. Instalar Salesforce CLI
+      # -----------------------------------------------------------------
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      # -----------------------------------------------------------------
+      # 5. Autenticar na org PRD
+      # -----------------------------------------------------------------
+      - name: Authenticate PRD Org
+        run: |
+          echo "${{ secrets.SF_PRD_AUTH_URL }}" > auth.url
+          sf org login sfdx-url --sfdx-url-file auth.url --alias prd-org
+          rm -f auth.url
+
+      # -----------------------------------------------------------------
+      # 6. Validar o estado alvo antes de deployar
+      # -----------------------------------------------------------------
+      - name: Validate target state in PRD (Dry Run)
+        run: |
+          echo "Validando estado da tag ${{ steps.resolve.outputs.target_tag }} em PRD..."
+          sf project deploy validate \
+            --source-dir force-app \
+            --target-org prd-org \
+            --test-level RunLocalTests \
+            --wait 120
+
+      # -----------------------------------------------------------------
+      # 7. Deploy da versão alvo em PRD (quick deploy)
+      # -----------------------------------------------------------------
+      - name: Deploy target version to PRD
+        run: |
+          echo "Restaurando ${{ steps.resolve.outputs.target_tag }} em PRD..."
+          sf project deploy quick \
+            --target-org prd-org \
+            --use-most-recent
+
+      # -----------------------------------------------------------------
+      # 8. Criar tag de rollback para auditoria
+      #    Formato: rollback-{versão-alvo}-{timestamp}
+      #    Permite rastrear quando e por quem o rollback foi feito
+      # -----------------------------------------------------------------
+      - name: Tag rollback event
+        if: success()
+        run: |
+          git checkout main
           git config user.name "github-actions"
           git config user.email "actions@github.com"
 
-          echo "Revertendo commit ${{ steps.find.outputs.merge_commit }}..."
+          TARGET_TAG="${{ steps.resolve.outputs.target_tag }}"
+          ROLLBACK_TAG="rollback-${TARGET_TAG}-$(date -u '+%Y%m%d-%H%M')"
 
-          git revert -m 1 ${{ steps.find.outputs.merge_commit }} --no-edit
+          git tag -a "$ROLLBACK_TAG" -m "Rollback para $TARGET_TAG
+Data alvo  : ${{ steps.resolve.outputs.tag_date }}
+Motivo     : ${{ inputs.reason }}
+Executado  : ${{ github.actor }}
+Data UTC   : $(date -u '+%Y-%m-%d %H:%M:%S')"
 
-          # Amend com mensagem detalhada
-          git commit --amend -m "revert: rollback ${{ steps.find.outputs.release_branch }} (PR #${{ inputs.pr_number }})
+          git push origin "$ROLLBACK_TAG"
+          echo "Tag de rollback criada: $ROLLBACK_TAG"
 
-          Motivo: ${{ inputs.reason }}
-          Release: ${{ steps.find.outputs.release_branch }}
-          Commit revertido: ${{ steps.find.outputs.merge_commit }}
-          Merge original por: ${{ steps.find.outputs.merged_by }}
-          Rollback executado por: ${{ github.actor }}"
-
-          git push origin main
-
-          echo "✅ Revert commitado e pushado na main."
+          echo "rollback_tag=$ROLLBACK_TAG" >> "$GITHUB_ENV"
 
       # -----------------------------------------------------------------
-      # 4. Criar tag de rollback
+      # 9. Publicar GitHub Release de rollback
+      #    Registra o evento de rollback no histórico de releases
       # -----------------------------------------------------------------
-      - name: Tag rollback
+      - name: Publish rollback release record
+        if: success()
         run: |
-          TAG_NAME="rollback-$(echo '${{ steps.find.outputs.release_branch }}' | tr '/' '-')-$(date +%Y%m%d-%H%M%S)"
+          TARGET_TAG="${{ steps.resolve.outputs.target_tag }}"
+          ROLLBACK_TAG="$rollback_tag"
+          TARGET_RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TARGET_TAG}"
 
-          git tag -a "$TAG_NAME" -m "Rollback ${{ steps.find.outputs.release_branch }}
-          PR: #${{ inputs.pr_number }}
-          Motivo: ${{ inputs.reason }}
-          Executado por: ${{ github.actor }}"
+          gh release create "$ROLLBACK_TAG" \
+            --title "⏪ Rollback → $TARGET_TAG" \
+            --notes "## Rollback executado
 
-          git push origin "$TAG_NAME"
-          echo "Tag criada: $TAG_NAME"
+| Campo | Valor |
+|-------|-------|
+| Versão restaurada | [\`$TARGET_TAG\`]($TARGET_RELEASE_URL) |
+| Data da versão | ${{ steps.resolve.outputs.tag_date }} |
+| Motivo | ${{ inputs.reason }} |
+| Executado por | @${{ github.actor }} |
+| Data UTC | $(date -u '+%Y-%m-%d %H:%M:%S') |
 
-      # -----------------------------------------------------------------
-      # 5. Comentar no PR da release branch
-      # -----------------------------------------------------------------
-      - name: Notify on PR
-        run: |
-          gh pr comment ${{ inputs.pr_number }} \
-            --repo ${{ github.repository }} \
-            --body "🔴 **ROLLBACK EXECUTADO**
-
-          | Item | Detalhe |
-          |------|---------|
-          | Release | \`${{ steps.find.outputs.release_branch }}\` |
-          | Motivo | ${{ inputs.reason }} |
-          | Executado por | @${{ github.actor }} |
-          | Data | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
-
-          **Próximos passos:**
-          1. Investigar o problema
-          2. Criar nova release branch (ex: \`release/hotfix-YYYY-MM-DD\`)
-          3. Squads abrem novos PRs com as correções
-          4. Passar por todo o fluxo novamente (CI → UAT → GMUD → PRD)
-
-          ⚠️ O push do revert na main disparou automaticamente o deploy PRD
-          que vai restaurar o estado anterior em produção."
+> O estado de PRD agora corresponde ao deploy da versão [\`$TARGET_TAG\`]($TARGET_RELEASE_URL).
+> Para avançar novamente, crie uma nova release branch com as correções necessárias."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------
+      # 10. Resumo no log do workflow
+      # -----------------------------------------------------------------
+      - name: Summary
+        if: always()
+        run: |
+          TARGET_TAG="${{ steps.resolve.outputs.target_tag }}"
+
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "## ✅ Rollback concluído" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Campo | Valor |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Versão restaurada | \`$TARGET_TAG\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Data da versão | ${{ steps.resolve.outputs.tag_date }} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Motivo | ${{ inputs.reason }} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Executado por | @${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ❌ Rollback falhou" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Tag alvo: \`$TARGET_TAG\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "Motivo: ${{ inputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Verifique os logs do workflow para detalhes." >> "$GITHUB_STEP_SUMMARY"
+          fi

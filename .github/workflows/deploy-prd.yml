@@ -2,7 +2,8 @@
 # Deploy PRD
 #
 # Gatilho: Push na branch main (após merge da release branch)
-# Objetivo: Deployar o código em produção após todas as validações
+# Objetivo: Deployar o código em produção, gerar ZIP do build e publicar
+#           uma GitHub Release versionada para rastreabilidade e rollback.
 #
 # Pré-requisitos:
 #   - Secret SF_PRD_AUTH_URL com a SFDX Auth URL da org PRD
@@ -14,10 +15,10 @@
 #     * GMUD aprovada por PR
 #   - Release branch mergeada na main pelo Release Manager
 #
-# Modelo Release Branch:
-#   O Release Manager mergeia a release branch (ex: release/2026-05-23)
-#   na main no dia do deploy. Esse merge dispara este workflow.
-#   A tag inclui quem aprovou, a data e as GMUDs incluídas.
+# Artefatos gerados a cada deploy bem-sucedido:
+#   - Git tag: v{YYYY}.{MM}.{DD}-{HHmm}  (ex: v2026.06.10-1430)
+#   - ZIP: force-app-v{YYYY}.{MM}.{DD}-{HHmm}.zip
+#   - GitHub Release: tag acima com o ZIP como asset para download/Spinnaker
 ###############################################################################
 
 name: Deploy PRD
@@ -37,7 +38,6 @@ jobs:
     # -----------------------------------------------------------------------
     # Environment PRD com aprovadores
     # Configure em: Settings > Environments > PRD > Required reviewers
-    # O workflow PARA aqui e aguarda aprovação manual
     # -----------------------------------------------------------------------
     environment: PRD
 
@@ -52,8 +52,19 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # -----------------------------------------------------------------
-      # 2. Extrair informações do merge da release branch
-      #    Identifica o PR da release, as GMUDs incluídas e quem mergeou
+      # 2. Definir versão/tag baseada na data de execução
+      #    Formato: v{YYYY}.{MM}.{DD}-{HHmm}  ex: v2026.06.10-1430
+      #    Exportada como TAG_NAME para todos os steps seguintes
+      # -----------------------------------------------------------------
+      - name: Set release version
+        id: version
+        run: |
+          TAG_NAME="v$(date -u '+%Y.%m.%d-%H%M')"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "Versão desta release: $TAG_NAME"
+
+      # -----------------------------------------------------------------
+      # 3. Extrair informações do merge da release branch
       # -----------------------------------------------------------------
       - name: Extract release info
         id: info
@@ -61,7 +72,6 @@ jobs:
           COMMIT_MSG=$(git log -1 --format="%s")
           echo "Commit: $COMMIT_MSG"
 
-          # Identifica o PR da release branch → main
           PR_NUM=$(echo "$COMMIT_MSG" | grep -oP '#\K[0-9]+' || echo "unknown")
 
           if [ "$PR_NUM" != "unknown" ]; then
@@ -72,12 +82,10 @@ jobs:
               --repo ${{ github.repository }} \
               --json mergedBy -q '.mergedBy.login' 2>/dev/null || echo "unknown")
 
-            # Busca todas as GMUDs dos PRs que foram mergeados na release branch
             RELEASE_BRANCH=$(gh pr view "$PR_NUM" \
               --repo ${{ github.repository }} \
               --json headRefName -q '.headRefName' 2>/dev/null || echo "unknown")
 
-            # Lista PRs mergeados na release branch e suas GMUDs
             if [ "$RELEASE_BRANCH" != "unknown" ]; then
               GMUDS=$(gh pr list \
                 --repo ${{ github.repository }} \
@@ -104,34 +112,34 @@ jobs:
             PR_COUNT="0"
           fi
 
-          echo "pr_num=$PR_NUM" >> "$GITHUB_OUTPUT"
-          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
-          echo "merged_by=$MERGED_BY" >> "$GITHUB_OUTPUT"
+          echo "pr_num=$PR_NUM"             >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PR_TITLE"         >> "$GITHUB_OUTPUT"
+          echo "merged_by=$MERGED_BY"       >> "$GITHUB_OUTPUT"
           echo "release_branch=$RELEASE_BRANCH" >> "$GITHUB_OUTPUT"
-          echo "pr_count=$PR_COUNT" >> "$GITHUB_OUTPUT"
-
-          echo "gmuds<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$GMUDS" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "pr_count=$PR_COUNT"         >> "$GITHUB_OUTPUT"
+          echo "gmuds<<EOF"                 >> "$GITHUB_OUTPUT"
+          echo "$GMUDS"                     >> "$GITHUB_OUTPUT"
+          echo "EOF"                        >> "$GITHUB_OUTPUT"
 
           echo "========================================"
-          echo "Release: $RELEASE_BRANCH"
-          echo "PR: #$PR_NUM - $PR_TITLE"
-          echo "Mergeado por: $MERGED_BY"
+          echo "Versão  : ${{ steps.version.outputs.tag_name }}"
+          echo "Release : $RELEASE_BRANCH"
+          echo "PR      : #$PR_NUM - $PR_TITLE"
+          echo "Merge por: $MERGED_BY"
           echo "PRs incluídos: $PR_COUNT"
-          echo "GMUDs: $GMUDS"
+          echo "GMUDs   : $GMUDS"
           echo "========================================"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # -----------------------------------------------------------------
-      # 3. Instalar Salesforce CLI
+      # 4. Instalar Salesforce CLI
       # -----------------------------------------------------------------
       - name: Install Salesforce CLI
         run: npm install -g @salesforce/cli
 
       # -----------------------------------------------------------------
-      # 4. Autenticar na org PRD
+      # 5. Autenticar na org PRD
       # -----------------------------------------------------------------
       - name: Authenticate PRD Org
         run: |
@@ -140,9 +148,7 @@ jobs:
           rm -f auth.url
 
       # -----------------------------------------------------------------
-      # 5. Validate (dry-run) em PRD
-      #    Executa a validação completa com testes antes do deploy real
-      #    Timeout de 120 minutos para orgs grandes
+      # 6. Validate (dry-run) em PRD com testes completos
       # -----------------------------------------------------------------
       - name: Validate in PRD (Dry Run)
         run: |
@@ -154,8 +160,7 @@ jobs:
             --wait 120
 
       # -----------------------------------------------------------------
-      # 6. Deploy real (quick deploy)
-      #    Usa o resultado da validação anterior para deploy instantâneo
+      # 7. Deploy real (quick deploy via resultado da validação)
       # -----------------------------------------------------------------
       - name: Deploy to PRD (Quick Deploy)
         run: |
@@ -165,8 +170,23 @@ jobs:
             --use-most-recent
 
       # -----------------------------------------------------------------
-      # 7. Criar tag de deploy para rastreabilidade
-      #    Inclui: release branch, aprovador, data, GMUDs e total de PRs
+      # 8. Gerar ZIP do build validado
+      #    O ZIP contém todo o force-app e é nomeado com a versão,
+      #    garantindo rastreabilidade 1:1 entre artefato e deploy.
+      # -----------------------------------------------------------------
+      - name: Package build artifact (ZIP)
+        if: success()
+        id: zip
+        run: |
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+          ZIP_NAME="force-app-${TAG_NAME}.zip"
+
+          zip -r "$ZIP_NAME" force-app/
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "ZIP gerado: $ZIP_NAME ($(du -sh $ZIP_NAME | cut -f1))"
+
+      # -----------------------------------------------------------------
+      # 9. Criar git tag anotada com metadados completos do deploy
       # -----------------------------------------------------------------
       - name: Tag successful deploy
         if: success()
@@ -174,57 +194,93 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
 
-          TAG_NAME="prd-$(date +%Y%m%d-%H%M%S)"
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
           GMUDS="${{ steps.info.outputs.gmuds }}"
 
-          git tag -a "$TAG_NAME" -m "PRD Deploy
-          Release: ${{ steps.info.outputs.release_branch }}
-          PR: #${{ steps.info.outputs.pr_num }} - ${{ steps.info.outputs.pr_title }}
-          Aprovado por: ${{ steps.info.outputs.merged_by }}
-          PRs incluídos: ${{ steps.info.outputs.pr_count }}
-          GMUDs: $GMUDS
-          Data: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          git tag -a "$TAG_NAME" -m "PRD Deploy $TAG_NAME
+Release  : ${{ steps.info.outputs.release_branch }}
+PR       : #${{ steps.info.outputs.pr_num }} - ${{ steps.info.outputs.pr_title }}
+Aprovado : ${{ steps.info.outputs.merged_by }}
+PRs      : ${{ steps.info.outputs.pr_count }}
+GMUDs    : $GMUDS
+Data UTC : $(date -u '+%Y-%m-%d %H:%M:%S')"
 
           git push origin "$TAG_NAME"
-
-          echo "✅ Tag criada: $TAG_NAME"
+          echo "Tag criada: $TAG_NAME"
 
       # -----------------------------------------------------------------
-      # 8. Comentar no PR da release branch
+      # 10. Publicar GitHub Release com o ZIP como asset
+      #     A release fica disponível em:
+      #       github.com/{owner}/{repo}/releases/tag/{TAG_NAME}
+      #     O ZIP pode ser baixado por Spinnaker ou qualquer CI/CD externo
+      #     via URL estável:
+      #       github.com/{owner}/{repo}/releases/download/{TAG_NAME}/{ZIP_NAME}
+      # -----------------------------------------------------------------
+      - name: Publish GitHub Release
+        if: success()
+        run: |
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+          ZIP_NAME="${{ steps.zip.outputs.zip_name }}"
+          GMUDS="${{ steps.info.outputs.gmuds }}"
+
+          gh release create "$TAG_NAME" \
+            "$ZIP_NAME" \
+            --title "Deploy PRD $TAG_NAME" \
+            --notes "## Deploy PRD $TAG_NAME
+
+| Campo | Valor |
+|-------|-------|
+| Release branch | \`${{ steps.info.outputs.release_branch }}\` |
+| PR | #${{ steps.info.outputs.pr_num }} — ${{ steps.info.outputs.pr_title }} |
+| Aprovado por | @${{ steps.info.outputs.merged_by }} |
+| PRs incluídos | ${{ steps.info.outputs.pr_count }} |
+| GMUDs | $GMUDS |
+| Data UTC | $(date -u '+%Y-%m-%d %H:%M:%S') |
+
+### Artefato
+\`$ZIP_NAME\` — build completo do \`force-app/\` deployado nesta versão.
+
+> Para rollback, use o workflow **Rollback PRD** informando a tag \`$TAG_NAME\` ou quantas versões deseja voltar."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------
+      # 11. Comentar no PR da release branch
       # -----------------------------------------------------------------
       - name: Comment deploy result on PR
         if: always()
         run: |
           PR_NUM="${{ steps.info.outputs.pr_num }}"
-          if [ "$PR_NUM" == "unknown" ]; then
-            exit 0
-          fi
+          if [ "$PR_NUM" == "unknown" ]; then exit 0; fi
 
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
           GMUDS="${{ steps.info.outputs.gmuds }}"
 
           if [ "${{ job.status }}" == "success" ]; then
+            RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG_NAME}"
             gh pr comment "$PR_NUM" \
               --repo ${{ github.repository }} \
               --body "🚀 **Deploy PRD realizado com sucesso!**
 
-          | Item | Detalhe |
-          |------|---------|
-          | Release | \`${{ steps.info.outputs.release_branch }}\` |
-          | Aprovado por | @${{ steps.info.outputs.merged_by }} |
-          | PRs incluídos | ${{ steps.info.outputs.pr_count }} |
-          | GMUDs | $GMUDS |
-          | Tag | \`prd-$(date +%Y%m%d-%H%M%S)\` |
-          | Data | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |"
+| Item | Detalhe |
+|------|---------|
+| Versão | [\`$TAG_NAME\`]($RELEASE_URL) |
+| Release | \`${{ steps.info.outputs.release_branch }}\` |
+| Aprovado por | @${{ steps.info.outputs.merged_by }} |
+| PRs incluídos | ${{ steps.info.outputs.pr_count }} |
+| GMUDs | $GMUDS |
+| Data UTC | $(date -u '+%Y-%m-%d %H:%M:%S') |
+
+📦 [Baixar artefato do build]($RELEASE_URL)"
           else
             gh pr comment "$PR_NUM" \
               --repo ${{ github.repository }} \
               --body "❌ **Deploy PRD falhou.**
 
-          Release: \`${{ steps.info.outputs.release_branch }}\`
-          GMUDs: $GMUDS
-          Verifique os logs do workflow para detalhes.
+Release: \`${{ steps.info.outputs.release_branch }}\`
+GMUDs: $GMUDS
 
-          **Ação necessária:** Investigar a falha e, se necessário, executar rollback."
+Verifique os logs do workflow. Se necessário, execute o **Rollback PRD**."
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
